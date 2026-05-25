@@ -252,6 +252,10 @@ def send_alert(category, company, summary):
     print(f"  Time    : {datetime.now().strftime('%H:%M:%S')}")
     print("="*60 + "\n")
 
+    import os, time
+    for _ in range(3):
+        os.system("afplay /System/Library/Sounds/Glass.aiff")
+        time.sleep(0.5)
     send_telegram(label, company, summary)
 
 # ─────────────────────────────────────────
