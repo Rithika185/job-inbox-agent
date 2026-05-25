@@ -2,7 +2,6 @@ import os
 import base64
 import json
 import time
-import subprocess
 import requests
 from datetime import datetime
 
@@ -16,7 +15,7 @@ from googleapiclient.discovery import build
 from groq import Groq
 
 # ─────────────────────────────────────────
-# 1. LOAD SETTINGS FROM config.env
+# 1. LOAD SETTINGS
 # ─────────────────────────────────────────
 
 def load_config():
@@ -32,13 +31,29 @@ def load_config():
 
 config = load_config()
 
-GROQ_API_KEY     = config.get("GROQ_API_KEY", "")
-TELEGRAM_TOKEN   = config.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = config.get("TELEGRAM_CHAT_ID", "")
-CHECK_EVERY      = 300  # seconds (5 minutes)
+GROQ_API_KEY     = os.environ.get("GROQ_API_KEY", config.get("GROQ_API_KEY", ""))
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", config.get("TELEGRAM_TOKEN", ""))
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", config.get("TELEGRAM_CHAT_ID", ""))
+CHECK_EVERY      = 300
 
 # ─────────────────────────────────────────
-# 2. FEW-SHOT EXAMPLES
+# 2. SETUP GMAIL CREDENTIALS FROM ENV
+# ─────────────────────────────────────────
+
+def setup_credentials_from_env():
+    creds_b64 = os.environ.get("CREDENTIALS_JSON")
+    token_b64  = os.environ.get("TOKEN_JSON")
+    if creds_b64 and not os.path.exists("credentials.json"):
+        with open("credentials.json", "w") as f:
+            f.write(base64.b64decode(creds_b64).decode("utf-8"))
+        print("   credentials.json loaded from environment")
+    if token_b64 and not os.path.exists("token.json"):
+        with open("token.json", "w") as f:
+            f.write(base64.b64decode(token_b64).decode("utf-8"))
+        print("   token.json loaded from environment")
+
+# ─────────────────────────────────────────
+# 3. FEW-SHOT EXAMPLES
 # ─────────────────────────────────────────
 
 EXAMPLES = """
@@ -48,11 +63,11 @@ Label: MOVING_FORWARD | Company invited candidate to complete assessment
 
 EXAMPLE 2 - REJECTED:
 Email: "Thank you for taking the time to interview with us. After careful consideration, we have decided to move forward with other candidates."
-Label: REJECTED | Company decided to pursue other candidates
+Label: REJECTED | Company decided to pursue other candidates after reviewing
 
 EXAMPLE 3 - OFFER:
 Email: "Congratulations! We are thrilled to extend you an offer to join our team as a Machine Learning Engineer. Please find the offer letter attached."
-Label: OFFER | Job offer extended
+Label: OFFER | Job offer extended to candidate
 
 EXAMPLE 4 - MOVING_FORWARD:
 Email: "Excited to continue the conversation! Could you please schedule a 30 minute call with our hiring manager next week?"
@@ -60,15 +75,39 @@ Label: MOVING_FORWARD | Interview call scheduling requested
 
 EXAMPLE 5 - REJECTED:
 Email: "We regret to inform you that we will not be moving forward with your application at this time. We wish you the best in your search."
-Label: REJECTED | Application not moving forward
+Label: REJECTED | Application explicitly rejected
 
 EXAMPLE 6 - IRRELEVANT:
 Email: "You have a new job alert: 50 new Machine Learning jobs in your area. Click here to view them."
 Label: IRRELEVANT | Job alert newsletter, not application update
+
+EXAMPLE 7 - IRRELEVANT:
+Email: "Thank you for applying to Quantum Machines. We received your information and will contact you if there is a good match. Regards, Quantum Machines hiring team."
+Label: IRRELEVANT | Auto-reply confirming application received, not a real decision
+
+EXAMPLE 8 - IRRELEVANT:
+Email: "Thanks for applying! We will review your submission and get back to you if we are able to move forward. We appreciate your interest."
+Label: IRRELEVANT | Automated acknowledgment email, not an actual hiring decision
+
+EXAMPLE 9 - IRRELEVANT:
+Email: "Hi Rithika, Thank you for your interest in employment at HubSync. If your qualifications match our needs, we will contact you to learn more about your fit in this position."
+Label: IRRELEVANT | Generic auto-reply after application, no real update on status
+
+EXAMPLE 10 - IRRELEVANT:
+Email: "We got it! Thanks for applying for Machine Learning Engineer. We received your application and will be in touch."
+Label: IRRELEVANT | Application confirmation auto-reply, not a status update
+
+EXAMPLE 11 - REJECTED:
+Email: "After carefully reviewing your background and experience, we have concluded that your profile does not match our current requirements."
+Label: REJECTED | Explicit rejection after reviewing profile
+
+EXAMPLE 12 - MOVING_FORWARD:
+Email: "We would like to invite you to the next stage of our hiring process. Please click the link below to schedule your technical interview."
+Label: MOVING_FORWARD | Invited to next stage of hiring process
 """
 
 # ─────────────────────────────────────────
-# 3. GMAIL SETUP
+# 4. GMAIL SETUP
 # ─────────────────────────────────────────
 
 SCOPES = [
@@ -83,15 +122,14 @@ def get_gmail_service():
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            with open("token.json", "w") as token:
+                token.write(creds.to_json())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file("credentials.json", SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
+            raise Exception("No valid Gmail credentials found!")
     return build("gmail", "v1", credentials=creds)
 
 # ─────────────────────────────────────────
-# 4. READ EMAILS
+# 5. READ EMAILS
 # ─────────────────────────────────────────
 
 def get_unread_emails(service):
@@ -139,14 +177,22 @@ def get_unread_emails(service):
     return emails
 
 # ─────────────────────────────────────────
-# 5. CLASSIFY EMAIL WITH GROQ
+# 6. CLASSIFY EMAIL WITH GROQ
 # ─────────────────────────────────────────
 
 def classify_email(email):
     client = Groq(api_key=GROQ_API_KEY)
 
     prompt = f"""You are an AI that classifies job application emails.
-Use the examples below to understand the patterns, then classify the new email.
+
+IMPORTANT RULES:
+- Auto-reply emails that just confirm an application was received are IRRELEVANT
+- Only classify as REJECTED if the company explicitly says they are NOT moving forward
+- Only classify as MOVING_FORWARD if the company explicitly invites next steps
+- "We will contact you if there's a match" = IRRELEVANT (not a real update)
+- "We will get back to you" = IRRELEVANT (not a real update)
+
+Use the examples below then classify the new email.
 
 {EXAMPLES}
 
@@ -158,10 +204,7 @@ Body: {email['body']}
 Reply in EXACTLY this format (one line only):
 CATEGORY | COMPANY_NAME | one sentence summary
 
-Categories to use: OFFER, MOVING_FORWARD, REJECTED, IRRELEVANT
-
-Example reply:
-MOVING_FORWARD | Google | Invited to schedule a technical interview"""
+Categories to use: OFFER, MOVING_FORWARD, REJECTED, IRRELEVANT"""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
@@ -172,7 +215,7 @@ MOVING_FORWARD | Google | Invited to schedule a technical interview"""
     return response.choices[0].message.content.strip()
 
 # ─────────────────────────────────────────
-# 6. SEND TELEGRAM MESSAGE
+# 7. SEND TELEGRAM MESSAGE
 # ─────────────────────────────────────────
 
 def send_telegram(label, company, summary):
@@ -191,7 +234,7 @@ def send_telegram(label, company, summary):
         print(f"   Telegram error: {e}")
 
 # ─────────────────────────────────────────
-# 7. ALERT — terminal + sound + telegram
+# 8. ALERT
 # ─────────────────────────────────────────
 
 def send_alert(category, company, summary):
@@ -209,16 +252,10 @@ def send_alert(category, company, summary):
     print(f"  Time    : {datetime.now().strftime('%H:%M:%S')}")
     print("="*60 + "\n")
 
-    # Mac sound alert
-    for _ in range(3):
-        os.system("afplay /System/Library/Sounds/Glass.aiff")
-        time.sleep(0.5)
-
-    # Telegram alert
     send_telegram(label, company, summary)
 
 # ─────────────────────────────────────────
-# 8. TRACK SEEN EMAILS
+# 9. TRACK SEEN EMAILS
 # ─────────────────────────────────────────
 
 def load_seen_ids():
@@ -232,7 +269,7 @@ def save_seen_ids(seen_ids):
         json.dump(list(seen_ids), f)
 
 # ─────────────────────────────────────────
-# 9. MAIN LOOP
+# 10. MAIN LOOP
 # ─────────────────────────────────────────
 
 def main():
@@ -241,6 +278,7 @@ def main():
     print(f"   Checking every {CHECK_EVERY // 60} minutes")
     print("="*60 + "\n")
 
+    setup_credentials_from_env()
     service  = get_gmail_service()
     seen_ids = load_seen_ids()
 
